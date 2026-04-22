@@ -378,16 +378,29 @@ class RedditTab(QWidget):
         self._status_label.setText(f"Testing… {current}/{total}")
 
     def _on_entry_tested(self, index: int, entry: RedditEntry):
-        """Update the master list and refresh only the matching table row."""
+        """Update the master list and refresh the matching table row in-place.
+
+        In-place update avoids a full table rebuild on every test result.
+        If the row isn't currently visible (e.g. it was filtered out while
+        testing ran), we fall back to a debounced rebuild instead.
+        """
         if 0 <= index < len(self._entries):
             self._entries[index] = entry
 
-        # Update only the one affected row — no full rebuild needed
+        # Find the table row whose column-1 UserRole equals the master index.
+        # UserRole is set to real_idx in _populate_row, which IS the master index.
+        found = False
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 1)
             if item and item.data(Qt.UserRole) == index:
                 self._populate_row(row, entry, index)
+                found = True
                 break
+
+        if not found:
+            # The row is not visible (filtered out or table not yet built).
+            # Schedule a debounced rebuild so the counts/colours stay accurate.
+            self._rebuild_timer.start()
 
     def _on_test_finished(self):
         self._testing = False

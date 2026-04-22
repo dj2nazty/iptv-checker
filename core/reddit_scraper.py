@@ -10,7 +10,7 @@ import threading
 import queue
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -595,6 +595,23 @@ class RedditScraper(QObject):
         """Apply sanity checks and append to found if the credential looks real."""
         if not server.startswith("http"):
             return
+        # Normalise server to scheme://host:port only — strip any path.
+        # Some patterns (e.g. _CRED_API) capture the full URL including
+        # the API path (/get.php, /player_api.php).  If that path is kept,
+        # _test_one builds URLs like:
+        #   http://host:8080/get.php/player_api.php?username=…
+        # which always returns 404 and marks every credential as "dead".
+        try:
+            _p = urlparse(server)
+            server = f"{_p.scheme}://{_p.netloc}".rstrip("/")
+        except Exception:
+            pass
+        if not server or not server.startswith("http"):
+            return
+
+        username = username.strip()
+        password = password.strip()
+
         if len(username) < 3 or len(password) < 3:
             return
         if len(username) > 60 or len(password) > 60:
@@ -665,18 +682,23 @@ class RedditTester(QObject):
         done  = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            # Map future → (master_index, original_entry) so we can recover
+            # the entry on exception even after _test_one modifies it in-place.
             futures = {pool.submit(self._test_one, e): (idx, e)
                        for idx, e in zip(indices, entries)}
-            for future in futures:
+
+            # Use as_completed() so results appear in the UI as each test
+            # finishes — not blocked behind the slowest server in submission order.
+            for future in as_completed(futures):
                 if self._stop_event.is_set():
                     break
-                idx, _ = futures[future]
+                idx, orig = futures[future]
                 try:
-                    result = future.result(timeout=60)
+                    result = future.result()
                 except Exception as exc:
-                    result = futures[future][1]
-                    result.status = "error"
-                    result.error_message = str(exc)[:80]
+                    orig.status = "error"
+                    orig.error_message = str(exc)[:80]
+                    result = orig
                 self._queue.put(("result", (idx, result)))
                 done += 1
                 self._queue.put(("progress", (done, total)))
@@ -685,7 +707,17 @@ class RedditTester(QObject):
 
     def _test_one(self, entry: RedditEntry) -> RedditEntry:
         entry.last_tested = datetime.now().strftime("%Y-%m-%d %H:%M")
-        s = entry.server
+
+        # Always normalise the server URL — strip any path that may have been
+        # stored from older scrapes (e.g. "http://host:8080/get.php").
+        # If we skip this, the test URL becomes:
+        #   http://host:8080/get.php/player_api.php?username=…  → 404 every time.
+        try:
+            _p = urlparse(entry.server)
+            s = f"{_p.scheme}://{_p.netloc}".rstrip("/")
+        except Exception:
+            s = entry.server
+
         u = entry.username
         pw = entry.password
 
