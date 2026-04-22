@@ -21,6 +21,8 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 # Optional: pycryptodome for paste.sh AES decryption
 try:
     from Crypto.Cipher import AES as _AES
+    from Crypto.Protocol.KDF import PBKDF2 as _PBKDF2
+    from Crypto.Hash import SHA512 as _SHA512
     _HAS_AES = True
 except ImportError:
     _HAS_AES = False
@@ -383,51 +385,49 @@ class RedditScraper(QObject):
     def _fetch_paste_sh(self, url: str) -> str:
         """Fetch and AES-decrypt a paste.sh encrypted paste.
 
-        paste.sh encrypts content client-side with CryptoJS AES-CBC.
+        paste.sh encrypts with CryptoJS AES-256-CBC using:
+          • v1 pastes: EVP_BytesToKey (SHA-512, OpenSSL style)
+          • v2/v3 pastes: PBKDF2-SHA512, 1 iteration  ← most common
         The passphrase is:  paste_id + serverkey + fragment_key + 'https://paste.sh'
-        The ciphertext is stored in an <input name="content"> field on the page.
+        Ciphertext is in an <input name="content" value="U2FsdGVkX1+..."> in the HTML.
         """
         if not _HAS_AES:
             return ""
         try:
             parsed = urlparse(url)
             paste_id = parsed.path.strip("/")   # e.g. "6lKOVi27"
-            fragment_key = parsed.fragment       # e.g. "fIdbbR3DaJC4yIJqaNmWizRg"
+            # Strip non-alphanumeric/-/_ from fragment, matching JS getKey() sanitisation
+            fragment_key = re.sub(r"[^A-Za-z0-9_\-]", "", parsed.fragment)
 
-            # Fetch the HTML page (without the fragment — browsers don't send it)
+            # Fetch the HTML page (browsers don't send the fragment to the server)
             page_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
             resp = self._session.get(page_url, timeout=15)
             resp.raise_for_status()
             html = resp.text
 
-            # Extract hidden form fields — try both attribute orderings
-            content_match = re.search(
-                r'<input[^>]+name=["\']content["\'][^>]+value=["\']([^"\']+)["\']'
-                r'|<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']content["\']',
-                html)
-            serverkey_match = re.search(
-                r'<input[^>]+name=["\']serverkey["\'][^>]+value=["\']([^"\']*)["\']'
-                r'|<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']serverkey["\']',
-                html)
-            type_match = re.search(
-                r'<input[^>]+name=["\']type["\'][^>]+value=["\']([^"\']*)["\']'
-                r'|<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']type["\']',
-                html)
-
-            if not content_match:
+            # ── Extract ciphertext ────────────────────────────────────────────
+            # The ciphertext is a CryptoJS AES blob — always starts with
+            # U2FsdGVkX1 (base64 of "Salted__"). Find it as a quoted attr value.
+            ct_match = re.search(r'"(U2FsdGVkX1[A-Za-z0-9+/\r\n]+=*)"', html)
+            if not ct_match:
                 return ""
+            ciphertext_b64 = ct_match.group(1).replace("\r", "").replace("\n", "")
 
-            # Each regex has two capture groups (alt orderings) — pick the non-None one
-            ciphertext_b64 = next(g for g in content_match.groups() if g is not None)
-            serverkey      = next((g for g in serverkey_match.groups() if g is not None), "") if serverkey_match else ""
-            paste_type     = next((g for g in type_match.groups()      if g is not None), "") if type_match else ""
+            # ── Extract serverkey and type from form hidden inputs ─────────────
+            sk_match = re.search(
+                r'name=["\']serverkey["\'].*?value=["\']([^"\']*)["\']', html, re.DOTALL)
+            tp_match = re.search(
+                r'name=["\']type["\'].*?value=["\']([^"\']*)["\']', html, re.DOTALL)
+            serverkey  = sk_match.group(1) if sk_match else ""
+            paste_type = tp_match.group(1) if tp_match else ""
 
-            # Build passphrase exactly as paste.sh JS does
+            # ── Build passphrase (matches JS getKey()) ────────────────────────
             passphrase = paste_id + serverkey + fragment_key + "https://paste.sh"
 
-            decrypted = _decrypt_cryptojs_aes(ciphertext_b64, passphrase)
+            # ── Decrypt ───────────────────────────────────────────────────────
+            decrypted = _decrypt_paste_sh(ciphertext_b64, passphrase, paste_type)
 
-            # Type v3 prepends a "Subject:\nContent-Type:\n\n" header — strip it
+            # v3 prepends "Subject: …\n\n" header — strip it
             if paste_type == "v3" and decrypted and "\n\n" in decrypted:
                 decrypted = decrypted.split("\n\n", 1)[1]
 
@@ -679,22 +679,15 @@ def _looks_like_iptv(text: str) -> bool:
     return any(kw in text for kw in keywords)
 
 
-def _evp_bytes_to_key(password: bytes, salt: bytes,
-                      key_len: int = 32, iv_len: int = 16) -> tuple:
-    """OpenSSL EVP_BytesToKey with MD5, 1 iteration — mirrors CryptoJS default key derivation."""
-    d = b""
-    d_i = b""
-    while len(d) < key_len + iv_len:
-        d_i = hashlib.md5(d_i + password + salt).digest()
-        d += d_i
-    return d[:key_len], d[key_len:key_len + iv_len]
+def _decrypt_paste_sh(ciphertext_b64: str, passphrase: str, paste_type: str) -> str:
+    """Decrypt a paste.sh CryptoJS AES-256-CBC ciphertext.
 
+    paste.sh stores: base64( b"Salted__" + salt(8) + aes_cbc_ciphertext )
 
-def _decrypt_cryptojs_aes(ciphertext_b64: str, passphrase: str) -> str:
-    """Decrypt a CryptoJS AES-CBC ciphertext (OpenSSL Salted__ format).
+    Key derivation depends on paste version:
+      v1  → EVP_BytesToKey with SHA-512 (OpenSSL -md sha512)
+      v2/v3 → PBKDF2-HMAC-SHA512, 1 iteration  ← default for new pastes
 
-    CryptoJS stores: base64( b"Salted__" + salt(8) + aes_cbc_ciphertext )
-    Key/IV are derived with EVP_BytesToKey (MD5, 1 round).
     Returns decrypted UTF-8 text, or '' on any error.
     """
     if not _HAS_AES:
@@ -705,9 +698,19 @@ def _decrypt_cryptojs_aes(ciphertext_b64: str, passphrase: str) -> str:
             return ""
         salt       = raw[8:16]
         ciphertext = raw[16:]
-        key, iv    = _evp_bytes_to_key(passphrase.encode("utf-8"), salt)
-        cipher     = _AES.new(key, _AES.MODE_CBC, iv)
-        decrypted  = cipher.decrypt(ciphertext)
+        pw_bytes   = passphrase.encode("utf-8")
+
+        if paste_type == "v1":
+            # v1: EVP_BytesToKey with SHA-512 (openssl enc -md sha512)
+            key, iv = _evp_bytes_to_key_sha512(pw_bytes, salt)
+        else:
+            # v2/v3 (default): PBKDF2-HMAC-SHA512, 1 iteration
+            dk   = _PBKDF2(pw_bytes, salt, dkLen=48, count=1, hmac_hash_module=_SHA512)
+            key  = dk[:32]
+            iv   = dk[32:48]
+
+        cipher    = _AES.new(key, _AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(ciphertext)
         # Remove PKCS7 padding
         pad = decrypted[-1]
         if isinstance(pad, int) and 1 <= pad <= 16:
@@ -715,6 +718,18 @@ def _decrypt_cryptojs_aes(ciphertext_b64: str, passphrase: str) -> str:
         return decrypted.decode("utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def _evp_bytes_to_key_sha512(password: bytes, salt: bytes,
+                              key_len: int = 32, iv_len: int = 16) -> tuple:
+    """OpenSSL EVP_BytesToKey with SHA-512, 1 iteration (paste.sh v1 KDF)."""
+    import hashlib as _hl
+    d = b""
+    d_i = b""
+    while len(d) < key_len + iv_len:
+        d_i = _hl.sha512(d_i + password + salt).digest()
+        d += d_i
+    return d[:key_len], d[key_len:key_len + iv_len]
 
 
 def _make_test_session() -> requests.Session:
