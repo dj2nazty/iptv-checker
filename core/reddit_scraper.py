@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import base64
+import hashlib
 import time
 import threading
 import queue
@@ -16,6 +17,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+
+# Optional: pycryptodome for paste.sh AES decryption
+try:
+    from Crypto.Cipher import AES as _AES
+    _HAS_AES = True
+except ImportError:
+    _HAS_AES = False
 
 # ── Reddit settings ────────────────────────────────────────────────────────────
 SUBREDDIT = "IPTV_ZONENEW"                              # fallback default only
@@ -70,14 +78,21 @@ def _to_raw_url(url: str) -> str:
 # Base64 blocks — at least 40 chars (short ones are almost never IPTV creds)
 _B64 = re.compile(r'(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{40,}={0,2})(?![A-Za-z0-9+/=])')
 
-# Paste-site URLs inside post bodies
+# Paste-site URLs inside post bodies (includes paste.sh)
 _PASTE_URL = re.compile(
     r'https?://(?:'
+    r'paste\.sh|'
     r'pastebin\.com|paste\.ee|hastebin\.com|ghostbin\.co|ghostbin\.com|'
     r'rentry\.co|rentry\.org|dpaste\.com|pasteio\.com|paste\.fo|'
     r'toptal\.com/developers/hastebin'
     r')/\S+'
 )
+
+# Paste-site hostnames used for Source 3/4 checks
+_PASTE_HOSTS = [
+    "paste.sh", "pastebin.com", "paste.ee", "hastebin", "ghostbin",
+    "rentry", "dpaste", "paste.fo", "pasteio",
+]
 
 # IPTV credential formats
 _CRED_PIPE   = re.compile(r'(https?://[^\s|<>\'"]{6,})\s*\|\s*([^\s|<>\'"]{3,})\s*\|\s*([^\s|<>\'"]{3,})')
@@ -293,17 +308,33 @@ class RedditScraper(QObject):
             entries.append(self._make_entry(post, *cred, source_type="post", source_url=post["url"]))
 
         # --- Source 2: base64 in post body ---
+        # Decoded strings may be bare URLs (e.g. paste.sh links) — fetch those too
         for decoded in self._decode_b64_from_text(post["selftext"]):
-            for cred in self._extract_creds(decoded):
-                entries.append(self._make_entry(post, *cred, source_type="post_b64", source_url=post["url"]))
+            decoded = decoded.strip()
+            if decoded.startswith(("http://", "https://")):
+                # The base64 decoded to a URL — fetch the paste content
+                content = self._fetch_paste_content(decoded)
+                if content:
+                    for cred in self._extract_creds(content):
+                        entries.append(self._make_entry(
+                            post, *cred, source_type="paste", source_url=decoded))
+                    # Also scan for nested base64 inside the paste
+                    for sub_decoded in self._decode_b64_from_text(content):
+                        for cred in self._extract_creds(sub_decoded):
+                            entries.append(self._make_entry(
+                                post, *cred, source_type="paste_b64", source_url=decoded))
+            else:
+                # Plain decoded text — look for creds directly
+                for cred in self._extract_creds(decoded):
+                    entries.append(self._make_entry(
+                        post, *cred, source_type="post_b64", source_url=post["url"]))
 
         # --- Source 3: paste links found anywhere in post ---
         paste_urls = list(dict.fromkeys(_PASTE_URL.findall(combined_text)))
         for purl in paste_urls:
             if self._stop_event.is_set():
                 break
-            raw = _to_raw_url(purl)
-            content = self._fetch_text(raw)
+            content = self._fetch_paste_content(purl)
             if not content:
                 continue
             for cred in self._extract_creds(content):
@@ -314,12 +345,8 @@ class RedditScraper(QObject):
 
         # --- Source 4: post link_url is itself a paste site ---
         link = post.get("link_url", "")
-        if link and any(s in link for s in [
-            "pastebin.com", "paste.ee", "hastebin", "ghostbin",
-            "rentry", "dpaste", "paste.fo", "pasteio"
-        ]) and link not in paste_urls:
-            raw = _to_raw_url(link)
-            content = self._fetch_text(raw)
+        if link and any(s in link for s in _PASTE_HOSTS) and link not in paste_urls:
+            content = self._fetch_paste_content(link)
             if content:
                 for cred in self._extract_creds(content):
                     entries.append(self._make_entry(post, *cred, source_type="paste", source_url=link))
@@ -350,6 +377,73 @@ class RedditScraper(QObject):
             resp = self._session.get(url, timeout=12)
             resp.raise_for_status()
             return resp.text
+        except Exception:
+            return ""
+
+    def _fetch_paste_sh(self, url: str) -> str:
+        """Fetch and AES-decrypt a paste.sh encrypted paste.
+
+        paste.sh encrypts content client-side with CryptoJS AES-CBC.
+        The passphrase is:  paste_id + serverkey + fragment_key + 'https://paste.sh'
+        The ciphertext is stored in an <input name="content"> field on the page.
+        """
+        if not _HAS_AES:
+            return ""
+        try:
+            parsed = urlparse(url)
+            paste_id = parsed.path.strip("/")   # e.g. "6lKOVi27"
+            fragment_key = parsed.fragment       # e.g. "fIdbbR3DaJC4yIJqaNmWizRg"
+
+            # Fetch the HTML page (without the fragment — browsers don't send it)
+            page_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            resp = self._session.get(page_url, timeout=15)
+            resp.raise_for_status()
+            html = resp.text
+
+            # Extract hidden form fields — try both attribute orderings
+            content_match = re.search(
+                r'<input[^>]+name=["\']content["\'][^>]+value=["\']([^"\']+)["\']'
+                r'|<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']content["\']',
+                html)
+            serverkey_match = re.search(
+                r'<input[^>]+name=["\']serverkey["\'][^>]+value=["\']([^"\']*)["\']'
+                r'|<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']serverkey["\']',
+                html)
+            type_match = re.search(
+                r'<input[^>]+name=["\']type["\'][^>]+value=["\']([^"\']*)["\']'
+                r'|<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']type["\']',
+                html)
+
+            if not content_match:
+                return ""
+
+            # Each regex has two capture groups (alt orderings) — pick the non-None one
+            ciphertext_b64 = next(g for g in content_match.groups() if g is not None)
+            serverkey      = next((g for g in serverkey_match.groups() if g is not None), "") if serverkey_match else ""
+            paste_type     = next((g for g in type_match.groups()      if g is not None), "") if type_match else ""
+
+            # Build passphrase exactly as paste.sh JS does
+            passphrase = paste_id + serverkey + fragment_key + "https://paste.sh"
+
+            decrypted = _decrypt_cryptojs_aes(ciphertext_b64, passphrase)
+
+            # Type v3 prepends a "Subject:\nContent-Type:\n\n" header — strip it
+            if paste_type == "v3" and decrypted and "\n\n" in decrypted:
+                decrypted = decrypted.split("\n\n", 1)[1]
+
+            return decrypted
+        except Exception:
+            return ""
+
+    def _fetch_paste_content(self, url: str) -> str:
+        """Fetch content from any paste URL, routing paste.sh through AES decryption."""
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if "paste.sh" in host:
+                return self._fetch_paste_sh(url)
+            raw = _to_raw_url(url)
+            return self._fetch_text(raw)
         except Exception:
             return ""
 
@@ -569,10 +663,58 @@ def _try_b64_decode(candidate: str) -> str:
 
 
 def _looks_like_iptv(text: str) -> bool:
-    """Heuristic: does decoded text resemble IPTV content?"""
-    keywords = ["http://", "https://", "player_api", ":8080", ":25461",
-                "m3u", "username=", "password=", "|", "get.php"]
-    return sum(1 for kw in keywords if kw in text) >= 2
+    """Heuristic: does decoded text resemble IPTV content?
+
+    A decoded value that is a bare URL (e.g. a paste.sh link) is always
+    considered relevant — we'll fetch it and check its content.
+    For non-URL text, require at least one IPTV-related keyword.
+    """
+    stripped = text.strip()
+    # Any bare URL is worth following
+    if stripped.startswith(("http://", "https://")):
+        return True
+    # Non-URL text: look for at least one IPTV indicator
+    keywords = ["player_api", ":8080", ":25461",
+                "m3u", "username=", "password=", "get.php"]
+    return any(kw in text for kw in keywords)
+
+
+def _evp_bytes_to_key(password: bytes, salt: bytes,
+                      key_len: int = 32, iv_len: int = 16) -> tuple:
+    """OpenSSL EVP_BytesToKey with MD5, 1 iteration — mirrors CryptoJS default key derivation."""
+    d = b""
+    d_i = b""
+    while len(d) < key_len + iv_len:
+        d_i = hashlib.md5(d_i + password + salt).digest()
+        d += d_i
+    return d[:key_len], d[key_len:key_len + iv_len]
+
+
+def _decrypt_cryptojs_aes(ciphertext_b64: str, passphrase: str) -> str:
+    """Decrypt a CryptoJS AES-CBC ciphertext (OpenSSL Salted__ format).
+
+    CryptoJS stores: base64( b"Salted__" + salt(8) + aes_cbc_ciphertext )
+    Key/IV are derived with EVP_BytesToKey (MD5, 1 round).
+    Returns decrypted UTF-8 text, or '' on any error.
+    """
+    if not _HAS_AES:
+        return ""
+    try:
+        raw = base64.b64decode(ciphertext_b64)
+        if raw[:8] != b"Salted__":
+            return ""
+        salt       = raw[8:16]
+        ciphertext = raw[16:]
+        key, iv    = _evp_bytes_to_key(passphrase.encode("utf-8"), salt)
+        cipher     = _AES.new(key, _AES.MODE_CBC, iv)
+        decrypted  = cipher.decrypt(ciphertext)
+        # Remove PKCS7 padding
+        pad = decrypted[-1]
+        if isinstance(pad, int) and 1 <= pad <= 16:
+            decrypted = decrypted[:-pad]
+        return decrypted.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 def _make_test_session() -> requests.Session:
