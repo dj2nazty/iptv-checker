@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -11,7 +12,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QSpinBox, QComboBox, QMenu, QApplication,
     QMessageBox, QFileDialog, QCheckBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QUrl
+from PyQt5.QtCore import Qt, pyqtSignal, QUrl, QTimer
 from PyQt5.QtGui import QColor, QDesktopServices, QFont
 
 from core.reddit_scraper import RedditEntry, RedditScraper, RedditTester
@@ -41,11 +42,22 @@ class RedditTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._entries: list[RedditEntry] = []
+        self._entries: list     = []
+        self._entry_keys: set   = set()   # O(1) dedup — mirrors unique_key() of _entries
         self._scraper  = RedditScraper(self)
         self._tester   = RedditTester(self)
         self._testing  = False
         self._scanning = False
+
+        # ── Debounce timer ─────────────────────────────────────────────────────
+        # Instead of rebuilding the table on every single entry arrival (which
+        # causes exponential slowdown when a paste has 50+ credentials), we wait
+        # 350 ms after the last entry before doing ONE rebuild.
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(350)
+        self._rebuild_timer.timeout.connect(self._rebuild_table)
+
         self._setup_ui()
         self._connect_signals()
         self._load_cache()
@@ -223,9 +235,7 @@ class RedditTab(QWidget):
 
     def on_settings_changed(self):
         """Called by MainWindow when the user saves settings."""
-        # Update the pages spinbox to match saved settings
         self._pages_spin.setValue(settings.reddit_max_pages)
-        # Show which subreddits are now active
         names = []
         for url in settings.reddit_urls:
             if "/r/" in url:
@@ -254,19 +264,38 @@ class RedditTab(QWidget):
         self._stop_btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         self._status_label.setText(summary)
-        self._save_cache()   # auto-save
+
+        # Flush any pending debounced rebuild first
+        if self._rebuild_timer.isActive():
+            self._rebuild_timer.stop()
+            self._rebuild_table()
+
+        # Save to disk in a background thread so the UI stays responsive
+        self._save_cache_async()
 
     def _on_error(self, msg: str):
         self._status_label.setText(f"Error: {msg}")
 
     # ── Entry received from scraper ───────────────────────────────────────────
     def _on_entry_found(self, entry: RedditEntry):
-        # Avoid duplicate keys
+        """Called on the UI thread for every new credential the scraper finds.
+
+        KEY FIX: previously this called _rebuild_table() on every single entry,
+        causing 50+ full table rebuilds when a paste.sh paste decrypts many
+        credentials at once — freezing the UI.  Now we:
+          1. Use a set for O(1) dedup (was O(n) linear scan).
+          2. Append the entry to the list immediately.
+          3. Schedule ONE debounced rebuild 350 ms after the last arrival.
+        """
         key = entry.unique_key()
-        if any(e.unique_key() == key for e in self._entries):
+        if key in self._entry_keys:         # O(1) — no more linear scan
             return
+        self._entry_keys.add(key)
         self._entries.append(entry)
-        self._rebuild_table()
+        # Start (or restart) the 350 ms debounce timer.
+        # If 50 entries arrive in 100 ms, the timer resets each time and only
+        # fires once — 350 ms after the final entry. One rebuild total.
+        self._rebuild_timer.start()
 
     # ── Testing ───────────────────────────────────────────────────────────────
     def _test_selected(self):
@@ -274,13 +303,15 @@ class RedditTab(QWidget):
         if not rows:
             QMessageBox.information(self, "Select rows", "Check or select rows to test.")
             return
-        entries = [self._visible_entry(r) for r in rows if self._visible_entry(r)]
+        vis = self._visible_entries()       # compute once, not once per row
+        entries = [vis[r] for r in rows if r < len(vis)]
         indices = rows[:len(entries)]
         self._start_testing(entries, indices)
 
     def _test_all_untested(self):
-        indices = [i for i, e in enumerate(self._visible_entries()) if e.status == "untested"]
-        entries = [self._visible_entries()[i] for i in indices]
+        vis = self._visible_entries()
+        indices = [i for i, e in enumerate(vis) if e.status == "untested"]
+        entries = [vis[i] for i in indices]
         if not entries:
             QMessageBox.information(self, "Nothing to test", "No untested entries found.")
             return
@@ -296,7 +327,7 @@ class RedditTab(QWidget):
         self._progress_bar.setValue(0)
         self._status_label.setText(f"Testing {len(entries)} credential(s)…")
 
-        # Map visible table rows → actual entries list
+        # Map visible table rows → actual master-list indices
         vis = self._visible_entries()
         real_indices = []
         for vi in indices:
@@ -314,11 +345,11 @@ class RedditTab(QWidget):
         self._status_label.setText(f"Testing… {current}/{total}")
 
     def _on_entry_tested(self, index: int, entry: RedditEntry):
-        """Update the master list and refresh the matching table row."""
+        """Update the master list and refresh only the matching table row."""
         if 0 <= index < len(self._entries):
             self._entries[index] = entry
 
-        # Find and update the row in the table
+        # Update only the one affected row — no full rebuild needed
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 1)
             if item and item.data(Qt.UserRole) == index:
@@ -330,8 +361,9 @@ class RedditTab(QWidget):
         self._stop_btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         active = sum(1 for e in self._entries if e.status == "active")
-        self._status_label.setText(f"Testing done! {active} active of {len(self._entries)} total.")
-        self._save_cache()
+        self._status_label.setText(
+            f"Testing done! {active} active of {len(self._entries)} total.")
+        self._save_cache_async()
 
     # ── Table management ─────────────────────────────────────────────────────
     def _visible_entries(self) -> list:
@@ -345,39 +377,45 @@ class RedditTab(QWidget):
         elif sort_idx == 1:  # oldest first
             filtered.sort(key=lambda e: e.post_timestamp)
         elif sort_idx == 2:  # by status
-            order = {"active": 0, "expired": 1, "blocked": 2, "dead": 3, "error": 4, "untested": 5}
+            order = {"active": 0, "expired": 1, "blocked": 2,
+                     "dead": 3, "error": 4, "untested": 5}
             filtered.sort(key=lambda e: (order.get(e.status, 9), -e.post_timestamp))
         elif sort_idx == 3:  # by server
             filtered.sort(key=lambda e: e.server.lower())
 
         return filtered
 
-    def _visible_entry(self, row: int):
-        vis = self._visible_entries()
-        if 0 <= row < len(vis):
-            return vis[row]
-        return None
-
     def _rebuild_table(self):
-        vis = self._visible_entries()
-        self._table.setRowCount(len(vis))
-        for row, entry in enumerate(vis):
-            real_idx = self._entries.index(entry) if entry in self._entries else row
-            self._populate_row(row, entry, real_idx)
+        """Repopulate the table from scratch.
 
-        total  = len(self._entries)
-        active = sum(1 for e in self._entries if e.status == "active")
+        Wrapped with viewport.setUpdatesEnabled(False/True) so Qt only redraws
+        once at the end, not once per cell — critical for 500+ row tables.
+        """
+        vis = self._visible_entries()
+
+        vp = self._table.viewport()
+        vp.setUpdatesEnabled(False)
+        try:
+            self._table.setRowCount(len(vis))
+            for row, entry in enumerate(vis):
+                real_idx = self._entries.index(entry) if entry in self._entries else row
+                self._populate_row(row, entry, real_idx)
+        finally:
+            vp.setUpdatesEnabled(True)
+
+        total    = len(self._entries)
+        active   = sum(1 for e in self._entries if e.status == "active")
+        untested = sum(1 for e in self._entries if e.status == "untested")
         self._stats_label.setText(
-            f"{total} found  |  {active} active  |  "
-            f"{sum(1 for e in self._entries if e.status == 'untested')} untested"
+            f"{total} found  |  {active} active  |  {untested} untested"
         )
 
     def _apply_filter(self):
         self._rebuild_table()
 
     def _populate_row(self, row: int, entry: RedditEntry, real_idx: int):
-        """Fill one table row with entry data."""
-        # Col 0: checkbox
+        """Fill one table row with entry data — reuses existing items where possible."""
+        # Col 0: checkbox (only create once)
         chk = self._table.item(row, 0)
         if chk is None:
             chk = QTableWidgetItem()
@@ -398,39 +436,39 @@ class RedditTab(QWidget):
             if bold:
                 f = item.font(); f.setBold(True); item.setFont(f)
             if col == 1:
-                item.setData(Qt.UserRole, real_idx)  # store master-list index
+                item.setData(Qt.UserRole, real_idx)
 
-        _cell(str(row + 1),            1)
-        _cell(entry.post_date,         2)
-        _cell(entry.post_title,        3)
-        _cell(entry.server,            4)
-        _cell(entry.username,          5)
-        _cell(entry.password,          6)
+        _cell(str(row + 1),              1)
+        _cell(entry.post_date,           2)
+        _cell(entry.post_title,          3)
+        _cell(entry.server,              4)
+        _cell(entry.username,            5)
+        _cell(entry.password,            6)
 
-        # Status with colour
         status_color = STATUS_COLORS.get(entry.status, "#cdd6f4")
-        _cell(entry.status,            7, color=status_color, bold=True)
+        _cell(entry.status,              7, color=status_color, bold=True)
 
         cons = (f"{entry.active_connections}/{entry.max_connections}"
                 if entry.max_connections else "—")
-        _cell(cons,                    8)
-        _cell(entry.expiry or "—",     9)
+        _cell(cons,                      8)
+        _cell(entry.expiry or "—",       9)
         _cell(str(entry.live_channels) if entry.live_channels else "—", 10)
 
     # ── Interaction ───────────────────────────────────────────────────────────
     def _on_double_click(self, index):
         row = index.row()
-        entry = self._visible_entry(row)
-        if entry and entry.m3u_url:
-            self.load_link_requested.emit(entry.m3u_url)
+        vis = self._visible_entries()
+        if 0 <= row < len(vis) and vis[row].m3u_url:
+            self.load_link_requested.emit(vis[row].m3u_url)
 
     def _show_context_menu(self, pos):
         row = self._table.rowAt(pos.y())
         if row < 0:
             return
-        entry = self._visible_entry(row)
-        if not entry:
+        vis = self._visible_entries()
+        if row >= len(vis):
             return
+        entry = vis[row]
 
         menu = QMenu(self)
         load_act   = menu.addAction("📺  Load Channels (double-click)")
@@ -463,6 +501,8 @@ class RedditTab(QWidget):
         elif action == test_act:
             self._start_testing([entry], [row])
         elif action == del_act:
+            key = entry.unique_key()
+            self._entry_keys.discard(key)
             if entry in self._entries:
                 self._entries.remove(entry)
             self._rebuild_table()
@@ -476,6 +516,7 @@ class RedditTab(QWidget):
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _save_cache(self):
+        """Synchronous save — used when the user explicitly clicks Save."""
         try:
             data = {
                 "version": 1,
@@ -486,6 +527,20 @@ class RedditTab(QWidget):
         except Exception as exc:
             self._status_label.setText(f"Save failed: {exc}")
 
+    def _save_cache_async(self):
+        """Save to disk in a background thread so the UI stays responsive."""
+        entries_snapshot = [e.to_dict() for e in self._entries]  # snapshot on UI thread
+
+        def _write():
+            try:
+                data = {"version": 1, "entries": entries_snapshot}
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass  # non-critical — user can always click Save manually
+
+        threading.Thread(target=_write, daemon=True).start()
+
     def _load_cache(self):
         if not os.path.exists(CACHE_FILE):
             return
@@ -493,13 +548,12 @@ class RedditTab(QWidget):
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             entries = [RedditEntry.from_dict(d) for d in data.get("entries", [])]
-            # Merge: add only entries not already present
-            seen = {e.unique_key() for e in self._entries}
             added = 0
             for e in entries:
-                if e.unique_key() not in seen:
+                k = e.unique_key()
+                if k not in self._entry_keys:
+                    self._entry_keys.add(k)
                     self._entries.append(e)
-                    seen.add(e.unique_key())
                     added += 1
             if added:
                 self._rebuild_table()
@@ -511,21 +565,23 @@ class RedditTab(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Reddit Cache", "", "JSON Files (*.json);;All Files (*)"
         )
-        if path:
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                entries = [RedditEntry.from_dict(d) for d in data.get("entries", [])]
-                seen = {e.unique_key() for e in self._entries}
-                added = sum(1 for e in entries if e.unique_key() not in seen)
-                for e in entries:
-                    if e.unique_key() not in seen:
-                        self._entries.append(e)
-                        seen.add(e.unique_key())
-                self._rebuild_table()
-                QMessageBox.information(self, "Loaded", f"Added {added} new credential(s).")
-            except Exception as exc:
-                QMessageBox.critical(self, "Error", str(exc))
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entries = [RedditEntry.from_dict(d) for d in data.get("entries", [])]
+            added = 0
+            for e in entries:
+                k = e.unique_key()
+                if k not in self._entry_keys:
+                    self._entry_keys.add(k)
+                    self._entries.append(e)
+                    added += 1
+            self._rebuild_table()
+            QMessageBox.information(self, "Loaded", f"Added {added} new credential(s).")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
 
     def _clear_all(self):
         if not self._entries:
@@ -536,8 +592,9 @@ class RedditTab(QWidget):
             QMessageBox.Yes | QMessageBox.No
         ) == QMessageBox.Yes:
             self._entries.clear()
+            self._entry_keys.clear()        # keep the set in sync
             self._rebuild_table()
-            self._save_cache()
+            self._save_cache_async()
 
 
 # ── tiny helper ──────────────────────────────────────────────────────────────
