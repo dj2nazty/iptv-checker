@@ -1,7 +1,7 @@
 """Application-wide constants."""
 
 APP_NAME = "IPTV Stream Checker"
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.4"
 
 # Stream checking defaults
 DEFAULT_CONCURRENCY = 10

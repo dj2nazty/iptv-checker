@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import threading
 
 from PyQt5.QtWidgets import (
@@ -33,6 +34,11 @@ STATUS_COLORS = {
     "untested": "#cdd6f4",   # text (white-ish)
 }
 
+# How often (seconds) to force a table refresh while entries are streaming in.
+# Without this cap, the 350 ms debounce never fires during a continuous scan
+# because each drain-cycle (150 ms) resets the timer.
+_MAX_REBUILD_INTERVAL = 2.0   # seconds
+
 
 class RedditTab(QWidget):
     """Tab that scrapes, decodes, and displays IPTV credentials from Reddit."""
@@ -49,18 +55,26 @@ class RedditTab(QWidget):
         self._testing  = False
         self._scanning = False
 
-        # ── Debounce timer ─────────────────────────────────────────────────────
-        # Instead of rebuilding the table on every single entry arrival (which
-        # causes exponential slowdown when a paste has 50+ credentials), we wait
-        # 350 ms after the last entry before doing ONE rebuild.
+        # ── Rebuild throttle ──────────────────────────────────────────────────
+        # Two-level strategy:
+        #   • _rebuild_timer  — fires 350 ms after the LAST entry (debounce).
+        #     Handles bursty arrivals cleanly.
+        #   • _last_rebuild   — monotonic clock of the last actual rebuild.
+        #     Forces a rebuild every _MAX_REBUILD_INTERVAL seconds even when
+        #     entries keep streaming in continuously (debounce alone never fires
+        #     if entries arrive faster than 350 ms apart).
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
         self._rebuild_timer.setInterval(350)
         self._rebuild_timer.timeout.connect(self._rebuild_table)
+        self._last_rebuild: float = 0.0
 
         self._setup_ui()
         self._connect_signals()
-        self._load_cache()
+
+        # Load cache in a background thread so startup isn't blocked by
+        # JSON parsing or a large initial table rebuild.
+        threading.Thread(target=self._load_cache_bg, daemon=True).start()
 
     # ── UI setup ──────────────────────────────────────────────────────────────
     def _setup_ui(self):
@@ -268,7 +282,7 @@ class RedditTab(QWidget):
         # Flush any pending debounced rebuild first
         if self._rebuild_timer.isActive():
             self._rebuild_timer.stop()
-            self._rebuild_table()
+        self._rebuild_table()
 
         # Save to disk in a background thread so the UI stays responsive
         self._save_cache_async()
@@ -280,22 +294,29 @@ class RedditTab(QWidget):
     def _on_entry_found(self, entry: RedditEntry):
         """Called on the UI thread for every new credential the scraper finds.
 
-        KEY FIX: previously this called _rebuild_table() on every single entry,
-        causing 50+ full table rebuilds when a paste.sh paste decrypts many
-        credentials at once — freezing the UI.  Now we:
-          1. Use a set for O(1) dedup (was O(n) linear scan).
-          2. Append the entry to the list immediately.
-          3. Schedule ONE debounced rebuild 350 ms after the last arrival.
+        Uses a two-level throttle to keep the UI live without burning CPU:
+          1. O(1) set-based dedup — no linear scan.
+          2. If it has been ≥ _MAX_REBUILD_INTERVAL seconds since last rebuild,
+             do an immediate rebuild (otherwise the debounce timer would never
+             fire while entries are streaming in continuously at < 350 ms apart).
+          3. Otherwise, start/restart the 350 ms debounce timer.
         """
         key = entry.unique_key()
-        if key in self._entry_keys:         # O(1) — no more linear scan
+        if key in self._entry_keys:         # O(1) — no linear scan
             return
         self._entry_keys.add(key)
         self._entries.append(entry)
-        # Start (or restart) the 350 ms debounce timer.
-        # If 50 entries arrive in 100 ms, the timer resets each time and only
-        # fires once — 350 ms after the final entry. One rebuild total.
-        self._rebuild_timer.start()
+
+        now = time.monotonic()
+        if now - self._last_rebuild >= _MAX_REBUILD_INTERVAL:
+            # Force an immediate rebuild — it's been too long since the last one.
+            # This keeps the table visually updating every ~2 s during long scans.
+            if self._rebuild_timer.isActive():
+                self._rebuild_timer.stop()
+            self._rebuild_table()           # updates self._last_rebuild
+        else:
+            # Debounce: rebuild 350 ms after the last entry in a burst.
+            self._rebuild_timer.start()
 
     # ── Testing ───────────────────────────────────────────────────────────────
     def _test_selected(self):
@@ -303,7 +324,7 @@ class RedditTab(QWidget):
         if not rows:
             QMessageBox.information(self, "Select rows", "Check or select rows to test.")
             return
-        vis = self._visible_entries()       # compute once, not once per row
+        vis = self._visible_entries()       # compute once
         entries = [vis[r] for r in rows if r < len(vis)]
         indices = rows[:len(entries)]
         self._start_testing(entries, indices)
@@ -365,7 +386,7 @@ class RedditTab(QWidget):
             f"Testing done! {active} active of {len(self._entries)} total.")
         self._save_cache_async()
 
-    # ── Table management ─────────────────────────────────────────────────────
+    # ── Table management ──────────────────────────────────────────────────────
     def _visible_entries(self) -> list:
         """Return entries that pass the current status filter, in sort order."""
         sf = self._status_filter.currentText()
@@ -388,20 +409,38 @@ class RedditTab(QWidget):
     def _rebuild_table(self):
         """Repopulate the table from scratch.
 
-        Wrapped with viewport.setUpdatesEnabled(False/True) so Qt only redraws
-        once at the end, not once per cell — critical for 500+ row tables.
+        KEY PERFORMANCE FIXES vs previous version:
+          • Build an id(entry) → master-index dict ONCE before the loop.
+            The old code called self._entries.index(entry) for every row, which
+            is O(n) per row → O(n²) total and O(n²×fields) comparison work.
+            For 500 entries that was 4 million field comparisons; for 2000 it
+            was 64 million — long enough to trigger "not responding".
+          • setUpdatesEnabled on the whole QTableWidget (not just the viewport)
+            so Qt suppresses ALL paint/layout events during the fill loop.
+          • Only call setRowCount when the row count actually changes (avoids
+            mass item deletion/creation on identical-size refreshes).
         """
+        self._last_rebuild = time.monotonic()
+
         vis = self._visible_entries()
 
-        vp = self._table.viewport()
-        vp.setUpdatesEnabled(False)
+        # O(1) reverse-index: id(entry) → position in self._entries
+        # Using object identity (id) is safe here — entries live in self._entries
+        # and are never replaced during a rebuild (testing replaces via index, not id).
+        entry_to_real_idx: dict = {id(e): i for i, e in enumerate(self._entries)}
+
+        # Suppress ALL repaints for the duration of the fill — one repaint at the end.
+        self._table.setUpdatesEnabled(False)
         try:
-            self._table.setRowCount(len(vis))
+            new_row_count = len(vis)
+            if self._table.rowCount() != new_row_count:
+                self._table.setRowCount(new_row_count)
+
             for row, entry in enumerate(vis):
-                real_idx = self._entries.index(entry) if entry in self._entries else row
+                real_idx = entry_to_real_idx.get(id(entry), row)
                 self._populate_row(row, entry, real_idx)
         finally:
-            vp.setUpdatesEnabled(True)
+            self._table.setUpdatesEnabled(True)
 
         total    = len(self._entries)
         active   = sum(1 for e in self._entries if e.status == "active")
@@ -415,7 +454,7 @@ class RedditTab(QWidget):
 
     def _populate_row(self, row: int, entry: RedditEntry, real_idx: int):
         """Fill one table row with entry data — reuses existing items where possible."""
-        # Col 0: checkbox (only create once)
+        # Col 0: checkbox (only create once per row)
         chk = self._table.item(row, 0)
         if chk is None:
             chk = QTableWidgetItem()
@@ -541,25 +580,41 @@ class RedditTab(QWidget):
 
         threading.Thread(target=_write, daemon=True).start()
 
-    def _load_cache(self):
+    def _load_cache_bg(self):
+        """Load the cache file in a background thread.
+
+        JSON parsing and dataclass construction happen off the UI thread.
+        We then post the result back to the UI thread via a one-shot QTimer
+        so the table rebuild runs safely on the correct thread.
+        """
         if not os.path.exists(CACHE_FILE):
             return
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             entries = [RedditEntry.from_dict(d) for d in data.get("entries", [])]
-            added = 0
-            for e in entries:
-                k = e.unique_key()
-                if k not in self._entry_keys:
-                    self._entry_keys.add(k)
-                    self._entries.append(e)
-                    added += 1
-            if added:
-                self._rebuild_table()
-                self._status_label.setText(f"Loaded {added} saved credential(s) from cache.")
         except Exception as exc:
-            self._status_label.setText(f"Cache load failed: {exc}")
+            # Post error back to UI thread
+            QTimer.singleShot(0, lambda: self._status_label.setText(
+                f"Cache load failed: {exc}"))
+            return
+
+        # Hand parsed entries back to the UI thread
+        QTimer.singleShot(0, lambda: self._apply_loaded_entries(entries, "cache"))
+
+    def _apply_loaded_entries(self, entries: list, source: str):
+        """Called on the UI thread after background loading finishes."""
+        added = 0
+        for e in entries:
+            k = e.unique_key()
+            if k not in self._entry_keys:
+                self._entry_keys.add(k)
+                self._entries.append(e)
+                added += 1
+        if added:
+            self._rebuild_table()
+            self._status_label.setText(
+                f"Loaded {added} saved credential(s) from {source}.")
 
     def _load_from_file(self):
         path, _ = QFileDialog.getOpenFileName(
