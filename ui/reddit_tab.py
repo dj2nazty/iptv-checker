@@ -104,6 +104,17 @@ class RedditTab(QWidget):
         self._pages_spin.setToolTip("Reddit pages to scan (100 posts per page)")
         toolbar.addWidget(self._pages_spin)
 
+        self._comments_chk = QCheckBox("Scan Comments")
+        self._comments_chk.setChecked(True)
+        self._comments_chk.setToolTip(
+            "Also fetch and scan each post's top comments.\n"
+            "Finds far more credentials — many OPs post creds\n"
+            "in comments to dodge automod.\n"
+            "Uncheck for a faster but less thorough scan."
+        )
+        self._comments_chk.setStyleSheet("color: #cdd6f4; padding-left: 4px;")
+        toolbar.addWidget(self._comments_chk)
+
         toolbar.addSpacing(12)
 
         self._test_sel_btn = QPushButton("⚡  Test Selected")
@@ -245,6 +256,7 @@ class RedditTab(QWidget):
         self._scraper.start(
             max_pages=self._pages_spin.value(),
             reddit_json_urls=json_urls,
+            scan_comments=self._comments_chk.isChecked(),
         )
 
     def on_settings_changed(self):

@@ -28,8 +28,8 @@ except ImportError:
     _HAS_AES = False
 
 # ── Reddit settings ────────────────────────────────────────────────────────────
-SUBREDDIT = "IPTV_ZONENEW"                              # fallback default only
-REDDIT_JSON_URL = f"https://www.reddit.com/r/{SUBREDDIT}/.json"  # fallback default only
+SUBREDDIT = "IPTV_ZONENEW"
+REDDIT_JSON_URL = f"https://www.reddit.com/r/{SUBREDDIT}/.json"
 POSTS_PER_PAGE = 100
 
 HEADERS = {
@@ -77,10 +77,10 @@ def _to_raw_url(url: str) -> str:
 
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
-# Base64 blocks — at least 40 chars (short ones are almost never IPTV creds)
+# Base64 blocks — at least 40 chars
 _B64 = re.compile(r'(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{40,}={0,2})(?![A-Za-z0-9+/=])')
 
-# Paste-site URLs inside post bodies (includes paste.sh)
+# Paste-site URLs inside post bodies
 _PASTE_URL = re.compile(
     r'https?://(?:'
     r'paste\.sh|'
@@ -90,16 +90,43 @@ _PASTE_URL = re.compile(
     r')/\S+'
 )
 
-# Paste-site hostnames used for Source 3/4 checks
+# Paste-site hostnames for Source 3/4 checks
 _PASTE_HOSTS = [
     "paste.sh", "pastebin.com", "paste.ee", "hastebin", "ghostbin",
     "rentry", "dpaste", "paste.fo", "pasteio",
 ]
 
-# IPTV credential formats
-_CRED_PIPE   = re.compile(r'(https?://[^\s|<>\'"]{6,})\s*\|\s*([^\s|<>\'"]{3,})\s*\|\s*([^\s|<>\'"]{3,})')
-_CRED_SPACE  = re.compile(r'(https?://\S{6,})\s+([A-Za-z0-9_.\-]{3,})\s+([A-Za-z0-9_.\-]{3,})(?:\s|$)')
-_CRED_API    = re.compile(r'(https?://[^?\s]{6,})/(?:player_api|get)\.php\?username=([^&\s]+)&password=([^\s&]+)')
+# ── Credential patterns ────────────────────────────────────────────────────────
+# FIX: expanded character classes, more formats, broader API coverage.
+
+# Format 1: pipe-separated  http://server|user|pass
+_CRED_PIPE = re.compile(
+    r'(https?://[^\s|<>\'"]{6,})\s*\|\s*([^\s|<>\'"]{3,60})\s*\|\s*([^\s|<>\'"]{3,60})'
+)
+
+# Format 2: space/newline-separated  http://server user pass
+# FIX: allow @, !, # in username/password — many providers use them
+_CRED_SPACE = re.compile(
+    r'(https?://\S{6,})\s+([A-Za-z0-9_.@\-]{3,60})\s+([A-Za-z0-9_.@\-!#]{3,60})(?:\s|$)'
+)
+
+# Format 3: any URL with username= and password= query params
+# FIX: was limited to /player_api.php and /get.php — now catches ANY endpoint
+_CRED_API = re.compile(
+    r'(https?://[^?\s]{6,})[^\s?]*\?[^\s]*?[?&]?username=([^&\s]{3,60})[^\s]*?&[^\s]*?password=([^\s&]{3,60})'
+)
+
+# Format 4: labeled block  (Server: URL / Username: user / Password: pass)
+# FIX: this entire format was missing — very common in human-written posts
+# Allows up to 4 intervening lines between each label
+_CRED_LABELED = re.compile(
+    r'(?:server[_ ]?(?:url)?|url|host|link|m3u|portal)\s*[:=]\s*(https?://[^\s\r\n]+)'
+    r'(?:[^\r\n]*[\r\n]+){0,4}'
+    r'(?:user(?:name)?|login|usr)\s*[:=]\s*([^\s\r\n]{3,60})'
+    r'(?:[^\r\n]*[\r\n]+){0,4}'
+    r'(?:pass(?:word)?|pwd|pw)\s*[:=]\s*([^\s\r\n]{3,60})',
+    re.IGNORECASE
+)
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -109,16 +136,16 @@ class RedditEntry:
     post_id:           str   = ""
     post_title:        str   = ""
     post_url:          str   = ""
-    post_date:         str   = ""     # human-readable "YYYY-MM-DD HH:MM"
-    post_timestamp:    float = 0.0    # Unix epoch — used for sorting
+    post_date:         str   = ""
+    post_timestamp:    float = 0.0
     server:            str   = ""
     username:          str   = ""
     password:          str   = ""
-    source_type:       str   = "post"  # "post" | "post_b64" | "paste" | "paste_b64"
+    source_type:       str   = "post"  # post | post_b64 | comment | paste | paste_b64
     source_url:        str   = ""
 
     # Filled in after API test
-    status:            str   = "untested"  # untested | active | expired | blocked | dead | error
+    status:            str   = "untested"
     account_status:    str   = ""
     active_connections: int  = 0
     max_connections:   int   = 0
@@ -145,9 +172,9 @@ class RedditEntry:
 class RedditScraper(QObject):
     """Background worker that scrapes Reddit posts and emits RedditEntry objects."""
 
-    entry_found      = pyqtSignal(object)       # RedditEntry
-    progress         = pyqtSignal(int, int, str) # current, total, message
-    finished         = pyqtSignal(str)           # summary message
+    entry_found      = pyqtSignal(object)        # RedditEntry
+    progress         = pyqtSignal(int, int, str)  # current, total, message
+    finished         = pyqtSignal(str)            # summary message
     scrape_error     = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -155,21 +182,27 @@ class RedditScraper(QObject):
         self._stop_event = threading.Event()
         self._queue: queue.Queue = queue.Queue()
         self._session = self._make_session()
+        self._scan_comments = True
         self._timer = QTimer(self)
         self._timer.setInterval(150)
         self._timer.timeout.connect(self._drain_queue)
 
     # ── public API ──────────────────────────────────────────────────────────
-    def start(self, max_pages: int = 5, reddit_json_urls: list = None):
+    def start(self, max_pages: int = 5, reddit_json_urls: list = None,
+              scan_comments: bool = True):
         """Start scraping.
 
         Args:
-            max_pages:        How many Reddit pages (100 posts each) to fetch.
-            reddit_json_urls: List of Reddit .json API URLs to scan.
-                              Falls back to the module-level REDDIT_JSON_URL constant.
+            max_pages:        Reddit pages to fetch (100 posts each).
+            reddit_json_urls: Reddit .json API URLs to scan.
+            scan_comments:    Also fetch and scan each post's top comments.
+                              Finds far more credentials (esp. when the OP
+                              puts creds in the first comment to dodge automod)
+                              but makes the scan 2–3× slower.
         """
         self._stop_event.clear()
         self._json_urls = reddit_json_urls or [REDDIT_JSON_URL]
+        self._scan_comments = scan_comments
         self._timer.start()
         t = threading.Thread(target=self._run, args=(max_pages,), daemon=True)
         t.start()
@@ -208,7 +241,6 @@ class RedditScraper(QObject):
 
     def _run(self, max_pages: int):
         try:
-            # Collect posts from every configured subreddit URL
             all_posts = []
             for json_url in self._json_urls:
                 if self._stop_event.is_set():
@@ -238,7 +270,7 @@ class RedditScraper(QObject):
                         found += 1
                         self._queue.put(("entry", entry))
                 if i < total - 1:
-                    time.sleep(0.4)
+                    time.sleep(0.3)
 
             self._queue.put(("finished",
                 f"Done! {found} unique credential(s) from {total} post(s)."))
@@ -248,9 +280,7 @@ class RedditScraper(QObject):
 
     # ── Reddit fetch ─────────────────────────────────────────────────────────
     def _fetch_posts(self, max_pages: int, json_url: str = None) -> list:
-        """Fetch posts from a single subreddit .json URL."""
         target_url = json_url or REDDIT_JSON_URL
-        # Extract display name for progress messages
         sub_name = target_url.split("/r/")[-1].split("/")[0] if "/r/" in target_url else target_url
 
         posts = []
@@ -296,42 +326,46 @@ class RedditScraper(QObject):
             after = data.get("data", {}).get("after")
             if not after:
                 break
-            time.sleep(1.2)  # Respect Reddit rate limits
+            time.sleep(1.2)
 
         return posts
 
     # ── Post processing ──────────────────────────────────────────────────────
     def _process_post(self, post: dict) -> list:
         entries = []
-        combined_text = f"{post['title']} {post['selftext']} {post['link_url']}"
+        selftext = post["selftext"]
+        link_url = post.get("link_url", "")
+        combined_text = f"{post['title']} {selftext} {link_url}"
 
-        # --- Source 1: post body (direct creds) ---
-        for cred in self._extract_creds(post["selftext"]):
-            entries.append(self._make_entry(post, *cred, source_type="post", source_url=post["url"]))
+        # --- Source 1: direct credentials in post body or link URL ---
+        # FIX: was only checking selftext — now checks link_url too.
+        # Catches direct API URLs posted as the submission link.
+        for text_src in (selftext, link_url):
+            if not text_src:
+                continue
+            for cred in self._extract_creds(text_src):
+                entries.append(self._make_entry(
+                    post, *cred, source_type="post", source_url=post["url"]))
 
-        # --- Source 2: base64 in post body ---
-        # Decoded strings may be bare URLs (e.g. paste.sh links) — fetch those too
-        for decoded in self._decode_b64_from_text(post["selftext"]):
+        # --- Source 2: base64 in post body → may decode to a paste URL ---
+        for decoded in self._decode_b64_from_text(selftext):
             decoded = decoded.strip()
             if decoded.startswith(("http://", "https://")):
-                # The base64 decoded to a URL — fetch the paste content
                 content = self._fetch_paste_content(decoded)
                 if content:
                     for cred in self._extract_creds(content):
                         entries.append(self._make_entry(
                             post, *cred, source_type="paste", source_url=decoded))
-                    # Also scan for nested base64 inside the paste
                     for sub_decoded in self._decode_b64_from_text(content):
                         for cred in self._extract_creds(sub_decoded):
                             entries.append(self._make_entry(
                                 post, *cred, source_type="paste_b64", source_url=decoded))
             else:
-                # Plain decoded text — look for creds directly
                 for cred in self._extract_creds(decoded):
                     entries.append(self._make_entry(
                         post, *cred, source_type="post_b64", source_url=post["url"]))
 
-        # --- Source 3: paste links found anywhere in post ---
+        # --- Source 3: paste links anywhere in the combined post text ---
         paste_urls = list(dict.fromkeys(_PASTE_URL.findall(combined_text)))
         for purl in paste_urls:
             if self._stop_event.is_set():
@@ -340,21 +374,65 @@ class RedditScraper(QObject):
             if not content:
                 continue
             for cred in self._extract_creds(content):
-                entries.append(self._make_entry(post, *cred, source_type="paste", source_url=purl))
+                entries.append(self._make_entry(
+                    post, *cred, source_type="paste", source_url=purl))
             for decoded in self._decode_b64_from_text(content):
                 for cred in self._extract_creds(decoded):
-                    entries.append(self._make_entry(post, *cred, source_type="paste_b64", source_url=purl))
+                    entries.append(self._make_entry(
+                        post, *cred, source_type="paste_b64", source_url=purl))
 
         # --- Source 4: post link_url is itself a paste site ---
-        link = post.get("link_url", "")
-        if link and any(s in link for s in _PASTE_HOSTS) and link not in paste_urls:
-            content = self._fetch_paste_content(link)
+        if link_url and any(s in link_url for s in _PASTE_HOSTS) and link_url not in paste_urls:
+            content = self._fetch_paste_content(link_url)
             if content:
                 for cred in self._extract_creds(content):
-                    entries.append(self._make_entry(post, *cred, source_type="paste", source_url=link))
+                    entries.append(self._make_entry(
+                        post, *cred, source_type="paste", source_url=link_url))
                 for decoded in self._decode_b64_from_text(content):
                     for cred in self._extract_creds(decoded):
-                        entries.append(self._make_entry(post, *cred, source_type="paste_b64", source_url=link))
+                        entries.append(self._make_entry(
+                            post, *cred, source_type="paste_b64", source_url=link_url))
+
+        # --- Source 5: top-level comments ---
+        # FIX: many IPTV posts put credentials in the first comment to dodge
+        # automod. Without this, those credentials are completely invisible.
+        if self._scan_comments and not self._stop_event.is_set():
+            for comment_body in self._fetch_comments(post):
+                if self._stop_event.is_set():
+                    break
+                if not comment_body:
+                    continue
+
+                # Direct credentials in comment
+                for cred in self._extract_creds(comment_body):
+                    entries.append(self._make_entry(
+                        post, *cred, source_type="comment", source_url=post["url"]))
+
+                # Base64 in comment
+                for decoded in self._decode_b64_from_text(comment_body):
+                    decoded = decoded.strip()
+                    if decoded.startswith(("http://", "https://")):
+                        content = self._fetch_paste_content(decoded)
+                        if content:
+                            for cred in self._extract_creds(content):
+                                entries.append(self._make_entry(
+                                    post, *cred, source_type="paste", source_url=decoded))
+                    else:
+                        for cred in self._extract_creds(decoded):
+                            entries.append(self._make_entry(
+                                post, *cred, source_type="comment_b64", source_url=post["url"]))
+
+                # Paste links inside comments
+                for purl in _PASTE_URL.findall(comment_body):
+                    if self._stop_event.is_set():
+                        break
+                    if purl in paste_urls:
+                        continue   # already processed above
+                    content = self._fetch_paste_content(purl)
+                    if content:
+                        for cred in self._extract_creds(content):
+                            entries.append(self._make_entry(
+                                post, *cred, source_type="paste", source_url=purl))
 
         return entries
 
@@ -374,6 +452,38 @@ class RedditScraper(QObject):
             m3u_url=f"{server}/get.php?username={username}&password={password}&type=m3u_plus",
         )
 
+    # ── Comment fetching ─────────────────────────────────────────────────────
+    def _fetch_comments(self, post: dict) -> list:
+        """Fetch the body text of the top 10 root-level comments for a post.
+
+        Reddit puts credentials in comments far more often than in post bodies
+        because automod on many IPTV subreddits removes posts with raw URLs.
+        """
+        try:
+            # post["url"] = https://www.reddit.com/r/sub/comments/id/title/
+            comment_url = post["url"].rstrip("/") + ".json"
+            resp = self._session.get(
+                comment_url,
+                params={"limit": 10, "depth": 1, "raw_json": 1},
+                timeout=12,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Reddit returns [post_listing, comment_listing]
+            if not isinstance(data, list) or len(data) < 2:
+                return []
+
+            children = data[1].get("data", {}).get("children", [])
+            return [
+                c.get("data", {}).get("body", "") or ""
+                for c in children
+                if c.get("kind") == "t1" and c.get("data", {}).get("body")
+            ]
+        except Exception:
+            return []
+
+    # ── Text fetching helpers ─────────────────────────────────────────────────
     def _fetch_text(self, url: str) -> str:
         try:
             resp = self._session.get(url, timeout=12)
@@ -383,37 +493,24 @@ class RedditScraper(QObject):
             return ""
 
     def _fetch_paste_sh(self, url: str) -> str:
-        """Fetch and AES-decrypt a paste.sh encrypted paste.
-
-        paste.sh encrypts with CryptoJS AES-256-CBC using:
-          • v1 pastes: EVP_BytesToKey (SHA-512, OpenSSL style)
-          • v2/v3 pastes: PBKDF2-SHA512, 1 iteration  ← most common
-        The passphrase is:  paste_id + serverkey + fragment_key + 'https://paste.sh'
-        Ciphertext is in an <input name="content" value="U2FsdGVkX1+..."> in the HTML.
-        """
+        """Fetch and AES-decrypt a paste.sh encrypted paste."""
         if not _HAS_AES:
             return ""
         try:
             parsed = urlparse(url)
-            paste_id = parsed.path.strip("/")   # e.g. "6lKOVi27"
-            # Strip non-alphanumeric/-/_ from fragment, matching JS getKey() sanitisation
+            paste_id = parsed.path.strip("/")
             fragment_key = re.sub(r"[^A-Za-z0-9_\-]", "", parsed.fragment)
 
-            # Fetch the HTML page (browsers don't send the fragment to the server)
             page_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
             resp = self._session.get(page_url, timeout=15)
             resp.raise_for_status()
             html = resp.text
 
-            # ── Extract ciphertext ────────────────────────────────────────────
-            # The ciphertext is a CryptoJS AES blob — always starts with
-            # U2FsdGVkX1 (base64 of "Salted__"). Find it as a quoted attr value.
             ct_match = re.search(r'"(U2FsdGVkX1[A-Za-z0-9+/\r\n]+=*)"', html)
             if not ct_match:
                 return ""
             ciphertext_b64 = ct_match.group(1).replace("\r", "").replace("\n", "")
 
-            # ── Extract serverkey and type from form hidden inputs ─────────────
             sk_match = re.search(
                 r'name=["\']serverkey["\'].*?value=["\']([^"\']*)["\']', html, re.DOTALL)
             tp_match = re.search(
@@ -421,13 +518,9 @@ class RedditScraper(QObject):
             serverkey  = sk_match.group(1) if sk_match else ""
             paste_type = tp_match.group(1) if tp_match else ""
 
-            # ── Build passphrase (matches JS getKey()) ────────────────────────
             passphrase = paste_id + serverkey + fragment_key + "https://paste.sh"
+            decrypted  = _decrypt_paste_sh(ciphertext_b64, passphrase, paste_type)
 
-            # ── Decrypt ───────────────────────────────────────────────────────
-            decrypted = _decrypt_paste_sh(ciphertext_b64, passphrase, paste_type)
-
-            # v3 prepends "Subject: …\n\n" header — strip it
             if paste_type == "v3" and decrypted and "\n\n" in decrypted:
                 decrypted = decrypted.split("\n\n", 1)[1]
 
@@ -449,8 +542,7 @@ class RedditScraper(QObject):
 
     # ── Base64 ───────────────────────────────────────────────────────────────
     def _decode_b64_from_text(self, text: str, depth: int = 0) -> list:
-        """Find all base64 blobs in text, decode them, return decoded strings.
-        Handles multi-layer base64 up to 3 levels deep."""
+        """Find and decode all base64 blobs in text. Handles 3 levels of nesting."""
         if depth > 3 or not text:
             return []
         results = []
@@ -463,32 +555,62 @@ class RedditScraper(QObject):
 
     # ── Credential extraction ─────────────────────────────────────────────────
     def _extract_creds(self, text: str) -> list:
-        """Return list of (server, username, password) tuples found in text."""
+        """Return (server, username, password) tuples found in text.
+
+        Applies all four patterns plus URL query-param parsing, then sanity-
+        checks each match to filter out false positives.
+        """
         found = []
         seen  = set()
 
-        for pat in (_CRED_PIPE, _CRED_SPACE, _CRED_API):
+        # ── Pattern-based extraction ──────────────────────────────────────────
+        for pat in (_CRED_PIPE, _CRED_SPACE, _CRED_API, _CRED_LABELED):
             for m in pat.finditer(text):
                 server   = m.group(1).rstrip("/").strip()
                 username = m.group(2).strip()
                 password = m.group(3).strip()
+                self._add_cred(server, username, password, found, seen)
 
-                # Sanity checks
-                if not server.startswith("http"):
-                    continue
-                if len(username) < 3 or len(password) < 3:
-                    continue
-                if "/" in username or "/" in password:
-                    continue
-                if username == password:
-                    continue
-
-                key = f"{server}|{username}|{password}"
-                if key not in seen:
-                    seen.add(key)
-                    found.append((server, username, password))
+        # ── URL query-param parsing ───────────────────────────────────────────
+        # FIX: catches any API endpoint with username= & password= params,
+        # not just /player_api.php and /get.php.
+        for url_m in re.finditer(r'https?://\S+', text):
+            raw_url = url_m.group(0).rstrip(".,;)\"'")
+            if "username=" not in raw_url or "password=" not in raw_url:
+                continue
+            try:
+                parsed   = urlparse(raw_url)
+                params   = parse_qs(parsed.query, keep_blank_values=False)
+                username = (params.get("username") or [""])[0]
+                password = (params.get("password") or [""])[0]
+                server   = f"{parsed.scheme}://{parsed.netloc}"
+                self._add_cred(server, username, password, found, seen)
+            except Exception:
+                pass
 
         return found
+
+    def _add_cred(self, server: str, username: str, password: str,
+                  found: list, seen: set) -> None:
+        """Apply sanity checks and append to found if the credential looks real."""
+        if not server.startswith("http"):
+            return
+        if len(username) < 3 or len(password) < 3:
+            return
+        if len(username) > 60 or len(password) > 60:
+            return
+        if username == password:
+            return
+        if " " in username or " " in password:
+            return
+        # usernames don't have slashes; allow slashes in passwords
+        if "/" in username:
+            return
+
+        key = f"{server}|{username}|{password}"
+        if key not in seen:
+            seen.add(key)
+            found.append((server, username, password))
 
 
 # ── Tester ────────────────────────────────────────────────────────────────────
@@ -654,7 +776,7 @@ def _try_b64_decode(candidate: str) -> str:
     for variant in [candidate, candidate + "=" * ((4 - len(candidate) % 4) % 4)]:
         for decode_fn in [base64.b64decode, base64.urlsafe_b64decode]:
             try:
-                raw = decode_fn(variant)
+                raw  = decode_fn(variant)
                 text = raw.decode("utf-8", errors="replace")
                 return text
             except Exception:
@@ -663,33 +785,18 @@ def _try_b64_decode(candidate: str) -> str:
 
 
 def _looks_like_iptv(text: str) -> bool:
-    """Heuristic: does decoded text resemble IPTV content?
-
-    A decoded value that is a bare URL (e.g. a paste.sh link) is always
-    considered relevant — we'll fetch it and check its content.
-    For non-URL text, require at least one IPTV-related keyword.
-    """
+    """Heuristic: does decoded text resemble IPTV content?"""
     stripped = text.strip()
-    # Any bare URL is worth following
     if stripped.startswith(("http://", "https://")):
         return True
-    # Non-URL text: look for at least one IPTV indicator
-    keywords = ["player_api", ":8080", ":25461",
-                "m3u", "username=", "password=", "get.php"]
-    return any(kw in text for kw in keywords)
+    keywords = ["player_api", ":8080", ":25461", ":8000", ":8181",
+                "m3u", "username=", "password=", "get.php",
+                "xtream", "iptv", "stream"]
+    return any(kw in text.lower() for kw in keywords)
 
 
 def _decrypt_paste_sh(ciphertext_b64: str, passphrase: str, paste_type: str) -> str:
-    """Decrypt a paste.sh CryptoJS AES-256-CBC ciphertext.
-
-    paste.sh stores: base64( b"Salted__" + salt(8) + aes_cbc_ciphertext )
-
-    Key derivation depends on paste version:
-      v1  → EVP_BytesToKey with SHA-512 (OpenSSL -md sha512)
-      v2/v3 → PBKDF2-HMAC-SHA512, 1 iteration  ← default for new pastes
-
-    Returns decrypted UTF-8 text, or '' on any error.
-    """
+    """Decrypt a paste.sh CryptoJS AES-256-CBC ciphertext."""
     if not _HAS_AES:
         return ""
     try:
@@ -701,17 +808,14 @@ def _decrypt_paste_sh(ciphertext_b64: str, passphrase: str, paste_type: str) -> 
         pw_bytes   = passphrase.encode("utf-8")
 
         if paste_type == "v1":
-            # v1: EVP_BytesToKey with SHA-512 (openssl enc -md sha512)
             key, iv = _evp_bytes_to_key_sha512(pw_bytes, salt)
         else:
-            # v2/v3 (default): PBKDF2-HMAC-SHA512, 1 iteration
-            dk   = _PBKDF2(pw_bytes, salt, dkLen=48, count=1, hmac_hash_module=_SHA512)
-            key  = dk[:32]
-            iv   = dk[32:48]
+            dk  = _PBKDF2(pw_bytes, salt, dkLen=48, count=1, hmac_hash_module=_SHA512)
+            key = dk[:32]
+            iv  = dk[32:48]
 
         cipher    = _AES.new(key, _AES.MODE_CBC, iv)
         decrypted = cipher.decrypt(ciphertext)
-        # Remove PKCS7 padding
         pad = decrypted[-1]
         if isinstance(pad, int) and 1 <= pad <= 16:
             decrypted = decrypted[:-pad]
