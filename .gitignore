@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.spec
+
+# PyInstaller output
+dist/
+build/
+*.spec
+
+# App runtime data — personal, not part of source
+settings.json
+reddit_cache.json
+active_links.txt
+*.m3u
+*.csv
+version_info.txt
+
+# Don't ignore requirements.txt
+!requirements.txt
+
+# Keep backup folder structure but not contents
+backup good links/*
+March Active Backup DEPOT/*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Inno Setup temp
+Output/
