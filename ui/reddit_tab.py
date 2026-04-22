@@ -69,6 +69,12 @@ class RedditTab(QWidget):
         self._rebuild_timer.timeout.connect(self._rebuild_table)
         self._last_rebuild: float = 0.0
 
+        # ── Column sort state (driven by clicking column headers) ──────────────
+        # Col 2 = Date Posted, descending = newest first by default
+        self._sort_col: int  = 2
+        self._sort_asc: bool = False   # False = descending (newest first)
+        self._all_checked: bool = False  # tracks select-all toggle state
+
         self._setup_ui()
         self._connect_signals()
 
@@ -159,11 +165,9 @@ class RedditTab(QWidget):
 
         filter_bar.addSpacing(10)
 
-        filter_bar.addWidget(QLabel("Sort by:"))
-        self._sort_combo = QComboBox()
-        self._sort_combo.addItems(["Date (newest)", "Date (oldest)", "Status", "Server"])
-        self._sort_combo.currentIndexChanged.connect(self._rebuild_table)
-        filter_bar.addWidget(self._sort_combo)
+        sort_hint = QLabel("Click any column header to sort  ·  Click ✓ header to select all")
+        sort_hint.setStyleSheet("color: #6c7086; font-size: 10px;")
+        filter_bar.addWidget(sort_hint)
 
         filter_bar.addStretch()
 
@@ -202,19 +206,31 @@ class RedditTab(QWidget):
         self._table.doubleClicked.connect(self._on_double_click)
 
         hdr = self._table.horizontalHeader()
-        hdr.setStretchLastSection(False)
+        # Every column is freely resizable — no Stretch mode that locks width.
         hdr.setSectionResizeMode(QHeaderView.Interactive)
-        hdr.setSectionResizeMode(3, QHeaderView.Stretch)   # Post Title stretches
-        hdr.resizeSection(0,  38)   # ✓
-        hdr.resizeSection(1,  35)   # #
-        hdr.resizeSection(2, 130)   # Date
+        hdr.setStretchLastSection(False)
+        hdr.setMinimumSectionSize(30)
+
+        # Show the sort arrow and connect header clicks.
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(2, Qt.DescendingOrder)   # default: Date, newest first
+        hdr.sectionClicked.connect(self._on_header_clicked)
+
+        # Sensible default widths (user can drag any of them).
+        hdr.resizeSection(0,  36)   # ✓  (select-all)
+        hdr.resizeSection(1,  36)   # #
+        hdr.resizeSection(2, 130)   # Date Posted
+        hdr.resizeSection(3, 220)   # Post Title
         hdr.resizeSection(4, 190)   # Server
         hdr.resizeSection(5, 110)   # Username
         hdr.resizeSection(6, 110)   # Password
-        hdr.resizeSection(7,  75)   # Status
+        hdr.resizeSection(7,  78)   # Status
         hdr.resizeSection(8,  85)   # Active/Max
         hdr.resizeSection(9, 130)   # Expiry
-        hdr.resizeSection(10, 60)   # Live Ch
+        hdr.resizeSection(10, 62)   # Live Ch
+
+        # Smooth pixel-level horizontal scrolling when cols exceed window width.
+        self._table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
 
         root.addWidget(self._table, 1)
 
@@ -413,22 +429,31 @@ class RedditTab(QWidget):
 
     # ── Table management ──────────────────────────────────────────────────────
     def _visible_entries(self) -> list:
-        """Return entries that pass the current status filter, in sort order."""
+        """Return entries that pass the current status filter, in header-sort order."""
         sf = self._status_filter.currentText()
         filtered = [e for e in self._entries if sf == "All" or e.status == sf]
 
-        sort_idx = self._sort_combo.currentIndex()
-        if sort_idx == 0:    # newest first
-            filtered.sort(key=lambda e: e.post_timestamp, reverse=True)
-        elif sort_idx == 1:  # oldest first
-            filtered.sort(key=lambda e: e.post_timestamp)
-        elif sort_idx == 2:  # by status
-            order = {"active": 0, "expired": 1, "blocked": 2,
-                     "dead": 3, "error": 4, "untested": 5}
-            filtered.sort(key=lambda e: (order.get(e.status, 9), -e.post_timestamp))
-        elif sort_idx == 3:  # by server
-            filtered.sort(key=lambda e: e.server.lower())
+        _STATUS_ORDER = {
+            "active": 0, "expired": 1, "blocked": 2,
+            "dead": 3, "error": 4, "untested": 5,
+        }
 
+        col = self._sort_col
+        asc = self._sort_asc
+
+        def _key(e):
+            if col == 2:  return e.post_timestamp
+            if col == 3:  return e.post_title.lower()
+            if col == 4:  return e.server.lower()
+            if col == 5:  return e.username.lower()
+            if col == 6:  return e.password.lower()
+            if col == 7:  return _STATUS_ORDER.get(e.status, 9)
+            if col == 8:  return e.active_connections
+            if col == 9:  return e.expiry or ""
+            if col == 10: return e.live_channels
+            return e.post_timestamp   # default / col 1 (#)
+
+        filtered.sort(key=_key, reverse=not asc)
         return filtered
 
     def _rebuild_table(self):
@@ -475,6 +500,40 @@ class RedditTab(QWidget):
         )
 
     def _apply_filter(self):
+        self._rebuild_table()
+
+    def _on_header_clicked(self, col: int):
+        """Handle a click on any column header.
+
+        Column 0 (✓): toggle select-all / deselect-all checkboxes.
+        All other columns: sort ascending on first click, descending on second,
+        and show the Qt sort indicator arrow in the header.
+        """
+        if col == 0:
+            # Toggle all checkboxes
+            self._all_checked = not self._all_checked
+            state = Qt.Checked if self._all_checked else Qt.Unchecked
+            self._table.setUpdatesEnabled(False)
+            try:
+                for row in range(self._table.rowCount()):
+                    item = self._table.item(row, 0)
+                    if item:
+                        item.setCheckState(state)
+            finally:
+                self._table.setUpdatesEnabled(True)
+            return
+
+        # Toggle direction if clicking the same column again, else start ascending.
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            # For Status col default to active-first (ascending in our order dict).
+            # For numeric cols (Active/Max, Live Ch) default to highest first.
+            self._sort_asc = col not in (8, 10)
+
+        qt_order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        self._table.horizontalHeader().setSortIndicator(col, qt_order)
         self._rebuild_table()
 
     def _populate_row(self, row: int, entry: RedditEntry, real_idx: int):
